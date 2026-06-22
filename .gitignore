@@ -1,0 +1,12 @@
+venv/
+
+qdrant_storage/
+
+__pycache__/
+*.pyc
+
+.cache/
+
+.env
+
+*.log
