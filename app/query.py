@@ -26,6 +26,12 @@ while True:
     t2 = time.time()
     print(f"⏱️  Qdrant search : {t2-t1:.2f}s")
 
+    # Après la recherche Qdrant, avant le reranking
+print("\n=== TOP 5 QDRANT ===")
+for r in results.points:
+    print(f"score {r.score:.3f} — {r.payload['text'][:200]}")
+    print("---")
+
     # Reranking
     pairs = [(query, r.payload["text"]) for r in results.points]
     scores = reranker.predict(pairs)
