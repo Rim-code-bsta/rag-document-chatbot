@@ -1,5 +1,7 @@
 # app/ui/streamlit_app.py — RAG Omnishore · version avec gestion des versions de documents
-
+import json
+import uuid
+from datetime import datetime
 import streamlit as st
 import time
 import sys
@@ -263,6 +265,18 @@ if "indexed_docs" not in st.session_state:
     st.session_state.indexed_docs = {}
 if "next_point_id" not in st.session_state:
     st.session_state.next_point_id = 0
+# ============================
+# CHAT HISTORY
+# ============================
+
+CHAT_DIR = Path("chat_history")
+CHAT_DIR.mkdir(exist_ok=True)
+
+if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 
 def ensure_collection(client):
@@ -286,9 +300,95 @@ def render_file_statuses(statuses):
         html += f'<div class="file-progress-row"><span class="file-progress-name">📄 {short}</span>{badge}</div>'
     return html
 
+# ============================
+# CHAT FUNCTIONS
+# ============================
 
-#  SIDEBAR 
+def chat_path(chat_id):
+    return CHAT_DIR / f"{chat_id}.json"
+
+
+def save_chat():
+
+    path = chat_path(st.session_state.current_chat_id)
+
+    title = "Nouvelle conversation"
+
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            title = msg["content"][:40]
+            break
+
+    data = {
+        "id": st.session_state.current_chat_id,
+        "title": title,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "messages": st.session_state.messages,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_chat(chat_id):
+
+    path = chat_path(chat_id)
+
+    if not path.exists():
+        return
+
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    st.session_state.current_chat_id = chat_id
+    st.session_state.messages = data["messages"]
+
+
+def new_chat():
+
+    st.session_state.current_chat_id = str(uuid.uuid4())
+    st.session_state.messages = []
+
+
+# SIDEBAR
 with st.sidebar:
+
+    # ============================
+    # CONVERSATIONS
+    # ============================
+
+    st.markdown("## 💬 Conversations")
+
+    if st.button("➕ Nouvelle conversation", use_container_width=True):
+
+        save_chat()
+        new_chat()
+        st.rerun()
+
+    # List previous conversations
+    for file in sorted(
+        CHAT_DIR.glob("*.json"),
+        reverse=True,
+        key=lambda x: x.stat().st_mtime,
+    ):
+
+        with open(file, encoding="utf-8") as f:
+            data = json.load(f)
+
+        if st.button(
+            data["title"],
+            key=file.stem,
+            use_container_width=True,
+        ):
+
+            load_chat(file.stem)
+            st.rerun()
+
+    st.divider()
+
+    # ============================
+    # DOCUMENTS
+    # ============================
     st.markdown("### 📁 Documents sources")
 
     uploaded_files = st.file_uploader(
@@ -641,6 +741,48 @@ pipeline_slot.markdown(render_pipeline({k["key"]: "idle" for k in STATIONS}, {})
 
 
 #  INPUT 
+# ============================
+# PREVIOUS CONVERSATION
+# ============================
+
+if st.session_state.messages:
+
+    st.markdown("## 💬 Conversation")
+
+    for msg in st.session_state.messages:
+
+        if msg["role"] == "user":
+            st.markdown(
+                f"""
+<div style="
+padding:10px;
+margin-bottom:10px;
+border-left:4px solid #4CAF50;
+background:#f8f9fa;
+border-radius:6px;">
+<b>👤 Vous :</b><br>
+{msg["content"]}
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+        else:
+
+            st.markdown(
+                f"""
+<div style="
+padding:10px;
+margin-bottom:20px;
+border-left:4px solid #2196F3;
+background:#f8f9fa;
+border-radius:6px;">
+<b>🤖 Assistant :</b><br>
+{msg["content"]}
+</div>
+""",
+                unsafe_allow_html=True,
+            )
 col1, col2 = st.columns([5, 1])
 with col1:
     query = st.text_input(
@@ -659,6 +801,14 @@ if ask and not st.session_state.indexed_docs:
     st.warning("Indexe d'abord au moins un document via la barre latérale 📁")
 
 elif ask and query:
+    st.session_state.messages.append(
+      {
+        "role": "user",
+        "content": query,
+      }
+    )
+
+    save_chat()
     embedder, reranker, client = load_models()
     states  = {k["key"]: "idle" for k in STATIONS}
     timings = {}
@@ -794,6 +944,30 @@ Réponse :"""
                     <div class="source-snippet">{point.payload['text'][:400]}…</div>
                 </div>
             </div>""", unsafe_allow_html=True)
+        
+        # =====================================
+        # SAVE THE CONVERSATION
+        # =====================================
+
+        st.session_state.messages.append(
+           {
+                 "role": "assistant",
+                 "content": answer,
+                 "sources": [
+              {
+                "file": point.payload.get("source", "inconnu"),
+                "version": point.payload.get("version_id", ""),
+                "score": float(score),
+               }
+               for point, score in ranked
+             ],
+             "timestamp": datetime.now().strftime("%H:%M"),
+             "response_time": total_time,
+           }
+        )
+
+        save_chat()
+
 
 elif ask and not query:
     st.warning("Tape une question avant de lancer la recherche 🙂")
