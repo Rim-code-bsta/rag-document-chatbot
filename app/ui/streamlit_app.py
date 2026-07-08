@@ -35,7 +35,7 @@ st.set_page_config(
 DOCS_DIR = Path("documents")
 DOCS_DIR.mkdir(exist_ok=True)
 
-#  KEYWORD MAP 
+# KEYWORD MAP
 KEYWORD_MAP = {
     "historique":   ["historique", "2015", "2016", "2017", "2018", "2019", "2020",
                      "fondation", "fondée", "fondé", "creation", "créée", "crée",
@@ -54,7 +54,7 @@ KEYWORD_MAP = {
 }
 
 
-#  VERSIONING HELPERS 
+# VERSIONING HELPERS
 # Each entry in st.session_state.indexed_docs is keyed by filename and holds:
 #   {
 #     "versions": [
@@ -67,7 +67,7 @@ KEYWORD_MAP = {
 #
 # version_id format: "<filename_stem>::v<N>"
 # This is stored in each Qdrant point's payload under the key "version_id",
-# allowing Qdrant's must-filter to restrict retrieval to selected versions only.
+# allowing Qdrant's must filter to restrict retrieval to selected versions only.
 
 def make_version_id(filename: str, version_num: int) -> str:
     stem = Path(filename).stem
@@ -93,7 +93,7 @@ def get_all_active_version_ids() -> list[str]:
     return ids
 
 
-#  KEYWORD DETECTION 
+# KEYWORD DETECTION
 def detect_keywords(query: str) -> list[str]:
     query_lower = query.lower()
     matched = []
@@ -116,7 +116,7 @@ def keyword_fallback(client, query, existing_points, version_filter: Filter | No
         limit=1000,
         with_payload=True,
         with_vectors=False,
-        scroll_filter=version_filter,   # ← respect version selection
+        scroll_filter=version_filter,   # respect version selection
     )[0]
 
     existing_ids = {p.id for p in existing_points}
@@ -132,7 +132,7 @@ def keyword_fallback(client, query, existing_points, version_filter: Filter | No
     return extra[:10]
 
 
-#  TABLE→TEXT CONVERTER 
+# TABLE TO TEXT CONVERTER
 def _markdown_tables_to_text(md: str) -> str:
     import re
     lines = md.split("\n")
@@ -162,12 +162,12 @@ def _markdown_tables_to_text(md: str) -> str:
     return "\n".join(output)
 
 
-#  SIGMOID 
+# SIGMOID
 def sigmoid(x: float) -> float:
     return 1 / (1 + math.exp(-x))
 
 
-#  CSS 
+# CSS
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
@@ -188,9 +188,6 @@ html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
 .brand-mark { width: 38px; height: 38px; border-radius: 50%; background: linear-gradient(135deg, var(--coral), var(--violet)); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1rem; color: #fff; flex-shrink: 0; }
 .brand-name { font-size: 1.1rem; font-weight: 700; color: var(--text-main); letter-spacing: 0.02em; }
 .brand-tagline { font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; letter-spacing: 0.12em; color: var(--mint); text-transform: uppercase; }
-.lab-title { font-size: 2.6rem; font-weight: 700; color: var(--text-main); line-height: 1.1; margin: 0; }
-.lab-title span { background: linear-gradient(90deg, var(--coral), var(--violet)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.lab-sub { color: var(--text-dim); font-size: 1rem; margin-top: 0.5rem; }
 .pipeline-wrap { display: flex; align-items: flex-start; gap: 0; margin: 2rem 0 1.5rem 0; overflow-x: auto; padding: 0.6rem 0 1rem 0; }
 .station { flex: 0 0 auto; width: 130px; height: 130px; border-radius: 50%; background: var(--bg-panel); border: 2px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); position: relative; }
 .station-icon { font-size: 1.5rem; margin-bottom: 0.25rem; display: block; }
@@ -226,7 +223,7 @@ html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
 .source-snippet { color: var(--text-dim); font-size: 0.87rem; line-height: 1.5; }
 .source-keyword-badge { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: var(--yellow); background: rgba(255,230,109,0.1); border: 1px solid rgba(255,230,109,0.3); padding: 0.1rem 0.5rem; border-radius: 50px; margin-left: 0.4rem; }
 
-/* ── VERSION HISTORY SIDEBAR STYLES ── */
+/* VERSION HISTORY SIDEBAR STYLES */
 .doc-block { background: var(--bg-panel-light); border-radius: 16px; padding: 0.8rem 1rem; margin-top: 0.6rem; border: 1px solid rgba(255,255,255,0.05); }
 .doc-block-name { font-weight: 600; color: var(--text-main); font-size: 0.82rem; word-break: break-all; margin-bottom: 0.5rem; }
 .version-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
@@ -248,11 +245,89 @@ section[data-testid="stSidebar"] * { color: var(--text-main) !important; }
 .file-progress-name { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-progress-status { font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; }
 .status-done { color: var(--mint); } .status-active { color: var(--yellow); } .status-idle { color: var(--text-dim); }
+
+/* ===========================
+   CHAT INPUT
+=========================== */
+
+/* Remove the white footer */
+[data-testid="stBottom"]{
+    background: transparent !important;
+}
+
+[data-testid="stBottomBlockContainer"]{
+    background: transparent !important;
+    padding-top: .5rem !important;
+    padding-bottom: 1.2rem !important;
+}
+
+/* Remove any white wrapper around the bottom area */
+.stBottom{
+    background: transparent !important;
+}
+
+.stBottom > div{
+    background: transparent !important;
+}
+
+/* Chat input container */
+[data-testid="stChatInput"]{
+    background: var(--bg-panel) !important;
+    border: 2px solid rgba(255,255,255,.08) !important;
+    border-radius: 999px !important;
+    overflow: hidden !important;
+    box-shadow: none !important;
+}
+
+/* Internal wrappers */
+[data-testid="stChatInput"] > div,
+[data-testid="stChatInput"] > div > div,
+[data-testid="stChatInput"] form,
+[data-testid="stChatInput"] form > div{
+    background: transparent !important;
+    border: none !important;
+}
+
+/* Textarea */
+[data-testid="stChatInput"] textarea{
+    background: var(--bg-panel) !important;
+    color: var(--text-main) !important;
+    caret-color: var(--mint) !important;
+    border: none !important;
+    box-shadow: none !important;
+    resize: none !important;
+}
+
+/* Placeholder */
+[data-testid="stChatInput"] textarea::placeholder{
+    color: var(--text-dim) !important;
+}
+
+/* Focus */
+[data-testid="stChatInput"]:focus-within{
+    border-color: var(--violet) !important;
+    box-shadow: 0 0 0 3px rgba(167,139,250,.18) !important;
+}
+
+/* Send button */
+[data-testid="stChatInputSubmitButton"]{
+    background: linear-gradient(90deg,var(--coral),var(--violet)) !important;
+    border-radius: 16px !important;
+}
+
+/* Main page background */
+[data-testid="stAppViewContainer"]{
+    background: var(--bg-deep) !important;
+}
+
+[data-testid="stMain"]{
+    background: transparent !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
-#  SESSION STATE INIT 
+# SESSION STATE INIT
 @st.cache_resource
 def load_models():
     embedder = SentenceTransformer("BAAI/bge-m3")
@@ -265,6 +340,7 @@ if "indexed_docs" not in st.session_state:
     st.session_state.indexed_docs = {}
 if "next_point_id" not in st.session_state:
     st.session_state.next_point_id = 0
+
 # ============================
 # CHAT HISTORY
 # ============================
@@ -308,6 +384,19 @@ def chat_path(chat_id):
     return CHAT_DIR / f"{chat_id}.json"
 
 
+def list_chats():
+    chats = []
+    for file in sorted(
+        CHAT_DIR.glob("*.json"),
+        reverse=True,
+        key=lambda x: x.stat().st_mtime,
+    ):
+        with open(file, encoding="utf-8") as f:
+            data = json.load(f)
+        chats.append({"id": file.stem, "title": data["title"]})
+    return chats
+
+
 def save_chat():
 
     path = chat_path(st.session_state.current_chat_id)
@@ -328,6 +417,8 @@ def save_chat():
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+    st.session_state.chat_list_cache = list_chats()
 
 
 def load_chat(chat_id):
@@ -350,6 +441,23 @@ def new_chat():
     st.session_state.messages = []
 
 
+def delete_chat(chat_id):
+
+    path = chat_path(chat_id)
+
+    if path.exists():
+        path.unlink()
+
+    st.session_state.chat_list_cache = list_chats()
+
+    if chat_id == st.session_state.current_chat_id:
+        new_chat()
+
+
+if "chat_list_cache" not in st.session_state:
+    st.session_state.chat_list_cache = list_chats()
+
+
 # SIDEBAR
 with st.sidebar:
 
@@ -360,29 +468,26 @@ with st.sidebar:
     st.markdown("## 💬 Conversations")
 
     if st.button("➕ Nouvelle conversation", use_container_width=True):
-
         save_chat()
         new_chat()
         st.rerun()
 
-    # List previous conversations
-    for file in sorted(
-        CHAT_DIR.glob("*.json"),
-        reverse=True,
-        key=lambda x: x.stat().st_mtime,
-    ):
+    for chat in st.session_state.chat_list_cache:
 
-        with open(file, encoding="utf-8") as f:
-            data = json.load(f)
+        is_active = chat["id"] == st.session_state.current_chat_id
+        label = ("🟢 " if is_active else "") + chat["title"]
 
-        if st.button(
-            data["title"],
-            key=file.stem,
-            use_container_width=True,
-        ):
-
-            load_chat(file.stem)
+        if st.button(label, key=f"open_{chat['id']}", use_container_width=True):
+            load_chat(chat["id"])
             st.rerun()
+
+    if st.session_state.chat_list_cache:
+        with st.expander("🗑️ Supprimer une conversation"):
+            options = {c["title"]: c["id"] for c in st.session_state.chat_list_cache}
+            to_delete = st.selectbox("Choisir", list(options.keys()), key="del_select")
+            if st.button("Confirmer la suppression", key="confirm_del"):
+                delete_chat(options[to_delete])
+                st.rerun()
 
     st.divider()
 
@@ -398,7 +503,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    #  Detect new uploads vs. new VERSIONS of existing files 
+    # Detect new uploads vs new VERSIONS of existing files
     # A file is a "new version" if its name already exists in indexed_docs.
     # A file is "new" if it has never been indexed.
     new_files   = []
@@ -437,7 +542,7 @@ with st.sidebar:
                 file_statuses[uploaded.name] = "active"
                 status_slot.markdown(render_file_statuses(file_statuses), unsafe_allow_html=True)
 
-                # Save file (append version number to avoid overwriting) 
+                # Save file (append version number to avoid overwriting)
                 version_num = next_version_number(uploaded.name)
                 version_id  = make_version_id(uploaded.name, version_num)
                 stem        = Path(uploaded.name).stem
@@ -447,7 +552,7 @@ with st.sidebar:
 
                 t_start = time.time()
 
-                #  Extract & convert tables 
+                # Extract and convert tables
                 pipeline_options = PdfPipelineOptions()
                 pipeline_options.do_ocr = False
 
@@ -461,7 +566,7 @@ with st.sidebar:
                 result      = converter.convert(str(save_path))
                 text_plain  = _markdown_tables_to_text(result.document.export_to_markdown())
 
-                #  Semantic chunking
+                # Semantic chunking
                 llama_doc   = Document(text=text_plain)
                 embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
                 splitter    = SemanticSplitterNodeParser(
@@ -471,7 +576,7 @@ with st.sidebar:
                 )
                 chunks = splitter.get_nodes_from_documents([llama_doc])
 
-                #add_metadata — spec de ton document de conception 
+                # add_metadata, spec de ton document de conception
                 # Chaque chunk LlamaIndex reçoit ses métadonnées AVANT
                 # l'embedding, exactement comme défini avec ton collaborateur :
                 #   chunk.metadata = {
@@ -505,7 +610,7 @@ with st.sidebar:
                     for i, c in enumerate(chunks)
                 ]
 
-                #  Construire les textes enrichis depuis chunk.metadata 
+                # Construire les textes enrichis depuis chunk.metadata
                 doc_name       = uploaded.name.replace("_", " ").replace(".pdf", "")
                 texts_enriched = []
                 texts_original = []
@@ -535,17 +640,17 @@ with st.sidebar:
                     PointStruct(
                         id=start_id + i,
                         vector=embeddings[i].tolist(),
-                        #  Payload Qdrant = miroir de chunk.metadata 
+                        # Payload Qdrant = miroir de chunk.metadata
                         # On recopie exactement les 4 champs de la spec plus
                         # les champs techniques nécessaires au filtrage et à
                         # l'affichage dans l'UI.
                         payload={
-                            #  spec 
+                            # spec
                             "document_id": chunks[i].metadata["document_id"],
                             "version":     chunks[i].metadata["version"],
                             "date":        chunks[i].metadata["date"],
                             "page":        chunks[i].metadata["page"],
-                            #  technique 
+                            # technique
                             "text":          texts_original[i],
                             "text_enriched": texts_enriched[i],
                             "source":        uploaded.name,
@@ -561,7 +666,7 @@ with st.sidebar:
                 elapsed = time.time() - t_start
                 st.session_state.next_point_id = start_id + len(texts_original)
 
-                #  Update session_state with versioned metadata 
+                # Update session_state with versioned metadata
                 version_entry = {
                     "version_id":  version_id,
                     "label":       f"v{version_num}",
@@ -589,7 +694,7 @@ with st.sidebar:
             time.sleep(0.6)
             st.rerun()
 
-    # VERSION HISTORY DISPLAY 
+    # VERSION HISTORY DISPLAY
     if st.session_state.indexed_docs:
         total_chunks = sum(
             v["n_chunks"]
@@ -631,7 +736,7 @@ with st.sidebar:
                 unsafe_allow_html=True
             )
 
-            #  Version selector (shown only when >1 version exists) 
+            # Version selector (shown only when more than one version exists)
             # Each checkbox is independent; the user can mix versions freely.
             # State is stored back into session_state.indexed_docs immediately.
             if n > 1:
@@ -694,22 +799,20 @@ with st.sidebar:
     )
 
 
-#  HERO 
+# HERO
 st.markdown("""
 <div class="lab-hero">
     <div class="brand-row">
         <div class="brand-mark">OM</div>
         <div>
-            <div class="brand-name">Omnishore <span style="color:#8B8DA8;font-weight:400;">— Groupe Medtech</span></div>
+            <div class="brand-name">Omnishore AI</div>
             <div class="brand-tagline">Architecte de votre transformation digitale</div>
         </div>
     </div>
-    <h1 class="lab-title">Pose ta question<br><span>à tes documents</span></h1>
-    <p class="lab-sub">Extraction → Embedding → Qdrant → Reranking → Mistral — pipeline RAG 100% local et vérifiable.</p>
 </div>""", unsafe_allow_html=True)
 
 
-#  PIPELINE VISUAL 
+# PIPELINE VISUAL
 STATIONS = [
     {"key": "extract", "icon": "📄", "label": "Extraction", "class": "s-extract"},
     {"key": "embed",   "icon": "🔢", "label": "Embedding",  "class": "s-embed"},
@@ -740,63 +843,21 @@ pipeline_slot = st.empty()
 pipeline_slot.markdown(render_pipeline({k["key"]: "idle" for k in STATIONS}, {}), unsafe_allow_html=True)
 
 
-#  INPUT 
 # ============================
-# PREVIOUS CONVERSATION
+# CONVERSATION
 # ============================
 
-if st.session_state.messages:
+for msg in st.session_state.messages:
+    with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+        st.markdown(msg["content"])
 
-    st.markdown("## 💬 Conversation")
-
-    for msg in st.session_state.messages:
-
-        if msg["role"] == "user":
-            st.markdown(
-                f"""
-<div style="
-padding:10px;
-margin-bottom:10px;
-border-left:4px solid #4CAF50;
-background:#f8f9fa;
-border-radius:6px;">
-<b>👤 Vous :</b><br>
-{msg["content"]}
-</div>
-""",
-                unsafe_allow_html=True,
-            )
-
-        else:
-
-            st.markdown(
-                f"""
-<div style="
-padding:10px;
-margin-bottom:20px;
-border-left:4px solid #2196F3;
-background:#f8f9fa;
-border-radius:6px;">
-<b>🤖 Assistant :</b><br>
-{msg["content"]}
-</div>
-""",
-                unsafe_allow_html=True,
-            )
-col1, col2 = st.columns([5, 1])
-with col1:
-    query = st.text_input(
-        "Question",
-        placeholder="Ex : Quel est l'historique de la société ?",
-        label_visibility="collapsed"
-    )
-with col2:
-    ask = st.button("Rechercher →", use_container_width=True)
+query = st.chat_input("Ex : Quel est l'historique de la société ?")
+ask = query is not None
 
 result_slot = st.empty()
 
 
-#  PIPELINE EXECUTION 
+# PIPELINE EXECUTION
 if ask and not st.session_state.indexed_docs:
     st.warning("Indexe d'abord au moins un document via la barre latérale 📁")
 
@@ -817,7 +878,7 @@ elif ask and query:
     timings["extract"] = 0.0
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
 
-    #  Embedding 
+    # Embedding
     states["embed"] = "active"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
     t0 = time.time()
@@ -826,10 +887,10 @@ elif ask and query:
     states["embed"]  = "done"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
 
-    #  Build version filter 
+    # Build version filter
     # get_all_active_version_ids() returns the union of all version_ids the user
-    # has checked in the sidebar. We pass this to Qdrant as a must-filter so
-    # only chunks from selected versions are retrieved — regardless of how many
+    # has checked in the sidebar. We pass this to Qdrant as a must filter so
+    # only chunks from selected versions are retrieved, regardless of how many
     # versions of each document exist in the collection.
     active_ids    = get_all_active_version_ids()
     version_filter = Filter(
@@ -841,7 +902,7 @@ elif ask and query:
         ]
     ) if active_ids else None
 
-    #  Qdrant search 
+    # Qdrant search
     states["qdrant"] = "active"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
     t0 = time.time()
@@ -851,7 +912,7 @@ elif ask and query:
         query=query_vector,
         limit=15,
         with_payload=True,
-        query_filter=version_filter,     # ← version-aware retrieval
+        query_filter=version_filter,     # version-aware retrieval
     )
 
     extra_points = keyword_fallback(client, query, results.points, version_filter)
@@ -861,7 +922,7 @@ elif ask and query:
     states["qdrant"]  = "done"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
 
-    #  Reranking 
+    # Reranking
     states["rerank"] = "active"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
     t0 = time.time()
@@ -881,7 +942,7 @@ elif ask and query:
     states["rerank"]  = "done"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
 
-    #  LLM 
+    # LLM
     states["llm"] = "active"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
     t0 = time.time()
@@ -944,7 +1005,7 @@ Réponse :"""
                     <div class="source-snippet">{point.payload['text'][:400]}…</div>
                 </div>
             </div>""", unsafe_allow_html=True)
-        
+
         # =====================================
         # SAVE THE CONVERSATION
         # =====================================
@@ -967,7 +1028,3 @@ Réponse :"""
         )
 
         save_chat()
-
-
-elif ask and not query:
-    st.warning("Tape une question avant de lancer la recherche 🙂")
