@@ -68,6 +68,12 @@ KEYWORD_MAP = {
 # version_id format: "<filename_stem>::v<N>"
 # This is stored in each Qdrant point's payload under the key "version_id",
 # allowing Qdrant's must filter to restrict retrieval to selected versions only.
+#
+# IMPORTANT: this dict lives in st.session_state, which is per-session and is
+# NOT persisted anywhere. Qdrant itself IS persisted. So on every fresh
+# session (app restart, new browser tab, etc.) we rebuild this dict directly
+# from what's actually stored in Qdrant — see rebuild_indexed_docs() below.
+# This is what fixes the "please re-index" / duplicate-version bug.
 
 def make_version_id(filename: str, version_num: int) -> str:
     stem = Path(filename).stem
@@ -91,6 +97,64 @@ def get_all_active_version_ids() -> list[str]:
     for doc in st.session_state.indexed_docs.values():
         ids.extend(doc.get("active_versions", []))
     return ids
+
+
+def rebuild_indexed_docs(client: QdrantClient) -> dict:
+    """
+    Reconstructs the indexed_docs registry (filename -> versions -> chunk counts,
+    etc.) directly from what's actually stored in Qdrant, instead of relying on
+    st.session_state, which is wiped every time the Streamlit process restarts
+    or a new session starts.
+
+    This is the source-of-truth rebuild: Qdrant is authoritative, session_state
+    is just a cache of it for display/filtering convenience.
+    """
+    if not client.collection_exists("documents"):
+        return {}
+
+    points, _ = client.scroll(
+        collection_name="documents",
+        limit=100_000,
+        with_payload=["document_id", "version", "version_id", "date"],
+        with_vectors=False,
+    )
+
+    if not points:
+        return {}
+
+    docs: dict[str, dict] = {}
+
+    for p in points:
+        payload = p.payload
+        fname = payload.get("document_id") or payload.get("source")
+        if not fname:
+            continue
+
+        vid = payload.get("version_id", "")
+        docs.setdefault(fname, {"versions": {}, "active_versions": []})
+
+        entry = docs[fname]["versions"].setdefault(vid, {
+            "version_id": vid,
+            "label": payload.get("version", "v1"),
+            "n_chunks": 0,
+            "time": 0.0,
+            "timestamp": payload.get("date", ""),
+        })
+        entry["n_chunks"] += 1
+
+    # Turn each document's version dict into a sorted list (by version_id,
+    # which sorts correctly since it ends in ::v1, ::v2, ...) and default the
+    # active selection to the latest version only, matching the behaviour
+    # of a freshly indexed document.
+    for fname, doc in docs.items():
+        versions_list = sorted(
+            doc["versions"].values(),
+            key=lambda v: v["version_id"],
+        )
+        doc["versions"] = versions_list
+        doc["active_versions"] = [versions_list[-1]["version_id"]]
+
+    return docs
 
 
 # KEYWORD DETECTION
@@ -328,18 +392,32 @@ section[data-testid="stSidebar"] * { color: var(--text-main) !important; }
 
 
 # SESSION STATE INIT
+
+@st.cache_resource
+def get_qdrant_client() -> QdrantClient:
+    """
+    Cached separately from the embedder/reranker so that rebuilding the
+    indexed_docs registry on startup is cheap (no need to load the heavy
+    embedding/reranking models just to check what's already in Qdrant).
+    """
+    return QdrantClient(host="localhost", port=6333)
+
+
 @st.cache_resource
 def load_models():
     embedder = SentenceTransformer("BAAI/bge-m3")
     reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", automodel_args={"torch_dtype": "auto"})
-    client = QdrantClient(host="localhost", port=6333)
+    client = get_qdrant_client()
     return embedder, reranker, client
 
 
 if "indexed_docs" not in st.session_state:
-    st.session_state.indexed_docs = {}
-if "next_point_id" not in st.session_state:
-    st.session_state.next_point_id = 0
+    # Rebuild from Qdrant (the real source of truth) instead of starting empty.
+    # This is what fixes "please index again" + duplicate-version bugs on
+    # every new session / app restart: Qdrant already has the data, we just
+    # weren't reading it back into session_state before.
+    _client = get_qdrant_client()
+    st.session_state.indexed_docs = rebuild_indexed_docs(_client)
 
 # ============================
 # CHAT HISTORY
@@ -635,10 +713,14 @@ with st.sidebar:
 
                 embeddings = embedder.encode(texts_enriched, show_progress_bar=False)
 
-                start_id = st.session_state.next_point_id
+                # Use UUIDs for point IDs instead of a manually-incremented
+                # counter. The counter used to live only in st.session_state,
+                # which resets on every new session — causing IDs to restart
+                # at 0 and silently overwrite previously indexed vectors in
+                # Qdrant. UUIDs remove the need for any cross-session counter.
                 points = [
                     PointStruct(
-                        id=start_id + i,
+                        id=str(uuid.uuid4()),
                         vector=embeddings[i].tolist(),
                         # Payload Qdrant = miroir de chunk.metadata
                         # On recopie exactement les 4 champs de la spec plus
@@ -664,7 +746,6 @@ with st.sidebar:
                 client.upsert(collection_name="documents", points=points)
 
                 elapsed = time.time() - t_start
-                st.session_state.next_point_id = start_id + len(texts_original)
 
                 # Update session_state with versioned metadata
                 version_entry = {
@@ -673,8 +754,6 @@ with st.sidebar:
                     "n_chunks":    len(texts_original),
                     "time":        elapsed,
                     "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "point_start": start_id,
-                    "point_end":   start_id + len(texts_original) - 1,
                 }
 
                 if uploaded.name not in st.session_state.indexed_docs:
@@ -767,11 +846,10 @@ with st.sidebar:
 
         st.markdown("<div style='margin-top:0.8rem;'></div>", unsafe_allow_html=True)
         if st.button("🗑️ Vider l'index", use_container_width=True):
-            embedder, reranker, client = load_models()
+            client = get_qdrant_client()
             if client.collection_exists("documents"):
                 client.delete_collection("documents")
-            st.session_state.indexed_docs  = {}
-            st.session_state.next_point_id = 0
+            st.session_state.indexed_docs = {}
             st.rerun()
     else:
         st.markdown(
