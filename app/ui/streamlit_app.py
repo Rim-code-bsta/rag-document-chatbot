@@ -1,6 +1,8 @@
 # app/ui/streamlit_app.py — RAG Omnishore · version avec gestion des versions de documents
 import json
 import uuid
+import shutil
+from urllib.parse import quote
 from datetime import datetime
 import streamlit as st
 import time
@@ -21,7 +23,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchAny,
+    Filter, FieldCondition, MatchAny, MatchValue,
 )
 import ollama
 
@@ -34,6 +36,31 @@ st.set_page_config(
 
 DOCS_DIR = Path("documents")
 DOCS_DIR.mkdir(exist_ok=True)
+
+# STATIC FILE SERVING (pour ouvrir le PDF source original au clic)
+# Streamlit ne sert des fichiers statiques QUE depuis un dossier "static/"
+# situé à côté du script en cours d'exécution (pas depuis un dossier
+# arbitraire, et pas depuis le répertoire de lancement). Cela nécessite aussi
+# d'activer enableStaticServing = true dans .streamlit/config.toml.
+# Voir : https://docs.streamlit.io/develop/concepts/configuration/serving-static-files
+STATIC_DOCS_DIR = Path(__file__).resolve().parent / "static" / "documents"
+STATIC_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sync_static_docs():
+    """
+    Copie dans static/documents/ tout PDF présent dans documents/ mais pas
+    encore synchronisé. Appelée à chaque exécution du script (donc aussi
+    juste après l'indexation d'un nouveau document, via st.rerun()) — idem-
+    potente, ne recopie pas les fichiers déjà présents.
+    """
+    for pdf_path in DOCS_DIR.glob("*.pdf"):
+        target = STATIC_DOCS_DIR / pdf_path.name
+        if not target.exists():
+            shutil.copy2(pdf_path, target)
+
+
+sync_static_docs()
 
 # KEYWORD MAP
 KEYWORD_MAP = {
@@ -196,6 +223,58 @@ def keyword_fallback(client, query, existing_points, version_filter: Filter | No
     return extra[:10]
 
 
+# CONTEXT EXPANSION
+# For each top-reranked chunk, fetch its immediate previous/next neighbor
+# (same document + version) and stitch them together before handing the
+# text to the LLM. This directly targets the chunk-splitting problem
+# identified earlier: when the semantic chunker cuts an enumerated section
+# (e.g. "types de facture") mid-way, the reranker may surface only one half
+# — this ensures the other half rides along as extra context even then,
+# rather than being omitted from generation entirely.
+def expand_with_neighbors(client, ranked_points: list) -> dict:
+    """
+    Returns {point.id: expanded_text} for each point in ranked_points,
+    where expanded_text is [previous_chunk?] + current_chunk + [next_chunk?]
+    joined with blank lines. Points without usable document_id/version_id/
+    chunk_id metadata (e.g. very old indexed data) fall back to just their
+    own text, unchanged.
+    """
+    expanded = {}
+
+    for point, _ in ranked_points:
+        doc_id     = point.payload.get("document_id")
+        version_id = point.payload.get("version_id")
+        chunk_id   = point.payload.get("chunk_id")
+        own_text   = point.payload.get("text", "")
+
+        if doc_id is None or version_id is None or not isinstance(chunk_id, int):
+            expanded[point.id] = own_text
+            continue
+
+        neighbor_filter = Filter(
+            must=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="version_id",  match=MatchValue(value=version_id)),
+                FieldCondition(key="chunk_id",    match=MatchAny(any=[chunk_id - 1, chunk_id + 1])),
+            ]
+        )
+        neighbors, _ = client.scroll(
+            collection_name="documents",
+            scroll_filter=neighbor_filter,
+            limit=2,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        prev_text = next((n.payload["text"] for n in neighbors if n.payload.get("chunk_id") == chunk_id - 1), None)
+        next_text = next((n.payload["text"] for n in neighbors if n.payload.get("chunk_id") == chunk_id + 1), None)
+
+        parts = [t for t in (prev_text, own_text, next_text) if t]
+        expanded[point.id] = "\n\n".join(parts)
+
+    return expanded
+
+
 # TABLE TO TEXT CONVERTER
 def _markdown_tables_to_text(md: str) -> str:
     import re
@@ -229,6 +308,91 @@ def _markdown_tables_to_text(md: str) -> str:
 # SIGMOID
 def sigmoid(x: float) -> float:
     return 1 / (1 + math.exp(-x))
+
+
+# INLINE CITATION LINKS
+# Matches "[Source 2]" or "(Source 2)", case-insensitive. Each match is
+# turned into a clickable number linking directly to the ORIGINAL PDF
+# document (opened in a new tab, jumping to the right page when possible),
+# rather than just scrolling to the retrieved chunk snippet — so the user
+# can read the full surrounding context manually if they want to.
+# The model is instructed to use the bracket form, but small local models
+# don't always follow formatting instructions exactly (same lesson as the
+# unanswered-question detection), so both bracket and parenthesis forms are
+# accepted.
+import re
+
+_CITATION_PATTERN     = re.compile(r'[\[\(]\s*[Ss]ource\s*(\d+)\s*[\]\)]')
+_VERSION_SUFFIX_RE    = re.compile(r'_v\d+$', re.IGNORECASE)
+
+
+def _normalize_stem(stem: str) -> str:
+    """Strips a trailing _v<N> suffix, if present, for fuzzy comparison."""
+    return _VERSION_SUFFIX_RE.sub('', stem)
+
+
+def resolve_static_pdf_filename(document_id: str, version_label: str) -> str | None:
+    """
+    Finds the actual filename of a document among the synced static PDFs.
+    Rather than blindly reconstructing "{stem}_{version}.pdf" (which breaks
+    the moment the real filename doesn't follow that exact pattern — e.g. a
+    document whose ORIGINAL uploaded name already contained "_v1" before the
+    versioning system existed, or a legacy file saved without any version
+    suffix at all), this tries progressively looser matches:
+      1. exact "{stem}_{version_label}.pdf"  (current naming convention)
+      2. exact "{stem}.pdf"                  (legacy, no version suffix)
+      3. any static PDF whose name, once a trailing "_vN" is stripped from
+         BOTH sides, matches the target — this is what recovers cases like
+         document_id stem "Report_v1" matching an actual file "Report.pdf".
+    Returns the matching filename (not the full path), or None if nothing
+    is found — callers must handle that case (no link, rather than a
+    broken one).
+    """
+    stem = Path(document_id).stem
+
+    for candidate in (f"{stem}_{version_label}.pdf", f"{stem}.pdf"):
+        if (STATIC_DOCS_DIR / candidate).exists():
+            return candidate
+
+    normalized_target = _normalize_stem(stem).lower()
+    for pdf_path in STATIC_DOCS_DIR.glob("*.pdf"):
+        if _normalize_stem(pdf_path.stem).lower() == normalized_target:
+            return pdf_path.name
+
+    return None
+
+
+def build_source_href(document_id: str, version_label: str, page) -> str | None:
+    """
+    Builds the URL to the original PDF, served by Streamlit's static file
+    feature from static/documents/ (see STATIC_DOCS_DIR / sync_static_docs
+    near the top of the file). Appends a #page=N fragment when a numeric
+    page is available, which Chrome/Edge/Firefox's built-in PDF viewer will
+    honor by opening directly at that page. Returns None if no matching
+    file can be found — callers should fall back to plain (non-clickable)
+    text in that case rather than link to a 404.
+    """
+    filename = resolve_static_pdf_filename(document_id, version_label)
+    if filename is None:
+        return None
+    href = f"app/static/documents/{quote(filename)}"
+    if isinstance(page, (int, float)) and not isinstance(page, bool):
+        href += f"#page={int(page)}"
+    return href
+
+
+def linkify_citations(answer: str, source_hrefs: list) -> str:
+    def _replace(m):
+        n = int(m.group(1))
+        if 1 <= n <= len(source_hrefs) and source_hrefs[n - 1]:
+            href = source_hrefs[n - 1]
+            return f'<a href="{href}" target="_blank" class="citation-link" title="Ouvrir le document source">{n}</a>'
+        # Out-of-range source number, or no matching file found for this
+        # source (see build_source_href) — leave the original text
+        # untouched rather than link to a 404.
+        return m.group(0)
+
+    return _CITATION_PATTERN.sub(_replace, answer)
 
 
 # CSS
@@ -284,8 +448,32 @@ html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
 .source-tag { font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: var(--violet); font-weight: 700; }
 .source-score { font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: var(--text-dim); background: rgba(167,139,250,0.12); padding: 0.15rem 0.6rem; border-radius: 50px; }
 .source-file { font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: var(--turquoise); margin-bottom: 0.3rem; }
+.source-file-link { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: var(--turquoise) !important; margin-bottom: 0.3rem; text-decoration: none; }
+.source-file-link:hover { text-decoration: underline; }
 .source-snippet { color: var(--text-dim); font-size: 0.87rem; line-height: 1.5; }
 .source-keyword-badge { font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: var(--yellow); background: rgba(255,230,109,0.1); border: 1px solid rgba(255,230,109,0.3); padding: 0.1rem 0.5rem; border-radius: 50px; margin-left: 0.4rem; }
+
+/* CLICKABLE INLINE CITATIONS */
+html { scroll-behavior: smooth; }
+.citation-link {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; margin: 0 2px; vertical-align: middle;
+    background: linear-gradient(135deg, var(--violet), var(--coral));
+    color: #fff !important; font-family: 'JetBrains Mono', monospace;
+    font-weight: 700; font-size: 0.68rem; border-radius: 50%;
+    text-decoration: none; transition: transform 0.15s ease;
+}
+.citation-link:hover { transform: scale(1.25); text-decoration: none; }
+.source-bubble { scroll-margin-top: 90px; transition: box-shadow 0.3s ease, border-color 0.3s ease; }
+.source-bubble:target {
+    border-color: var(--mint);
+    box-shadow: 0 0 0 3px rgba(6,255,165,0.3);
+    animation: source-flash 1.6s ease-out;
+}
+@keyframes source-flash {
+    0%   { background: rgba(6,255,165,0.18); }
+    100% { background: var(--bg-panel); }
+}
 
 /* VERSION HISTORY SIDEBAR STYLES */
 .doc-block { background: var(--bg-panel-light); border-radius: 16px; padding: 0.8rem 1rem; margin-top: 0.6rem; border: 1px solid rgba(255,255,255,0.05); }
@@ -431,6 +619,88 @@ if "current_chat_id" not in st.session_state:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# ============================
+# FEEDBACK & UNANSWERED-QUESTION LOGGING (axes 6 & 9 du doc original)
+# ============================
+# Two append-only JSONL logs, kept separate from chat_history/*.json so they
+# can be read and aggregated independently for the report (e.g. "% negative
+# feedback", "list of gaps in the documentation").
+FEEDBACK_LOG    = Path("feedback_log.jsonl")
+UNANSWERED_LOG  = Path("unanswered_questions.jsonl")
+
+# Match (case-insensitively) against a set of common "no answer" phrasings,
+# not just the exact wording requested in the prompt. Small local models like
+# Mistral 7B don't reliably stick to an exact instructed phrase — they
+# paraphrase ("n'est pas explicitement mentionné...", "il faudrait consulter
+# d'autres sources", etc.) — so a single hardcoded string misses most real
+# cases. This list is a heuristic, not exhaustive: extend it whenever you
+# spot a new "no answer" phrasing slipping through in feedback_stats.py.
+NO_INFO_PHRASES = [
+    "je n'ai pas suffisamment d'informations",
+    "n'est pas explicitement mentionné",
+    "n'est pas mentionné dans les sources",
+    "ne sont pas mentionnés dans les sources",
+    "les sources ne mentionnent pas",
+    "les sources fournies ne mentionnent pas",
+    "pas mentionné dans les documents",
+    "aucune information",
+    "je ne trouve pas",
+    "je n'ai pas trouvé",
+    "consulter d'autres sources",
+    "n'est pas disponible dans les sources",
+]
+
+
+def _append_jsonl(path: Path, entry: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def is_unanswered(answer: str) -> bool:
+    answer_lower = answer.lower()
+    return any(phrase in answer_lower for phrase in NO_INFO_PHRASES)
+
+
+def log_unanswered(question: str, answer: str, active_ids: list, chat_id: str):
+    _append_jsonl(UNANSWERED_LOG, {
+        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "chat_id":    chat_id,
+        "question":   question,
+        "answer":     answer,
+        "active_versions": active_ids,
+    })
+
+
+def handle_feedback(message_id: str, question: str, answer: str, sources: list, feedback_value: str):
+    """
+    Button on_click callback (like/dislike). Using on_click rather than a
+    plain `if st.button(...)` block guarantees this runs at the moment of the
+    click, regardless of whether the surrounding UI block re-renders after
+    the resulting Streamlit rerun (it won't, since this lives inside the
+    "answer just generated" block, which only executes on the turn a
+    question is asked).
+    """
+    _append_jsonl(FEEDBACK_LOG, {
+        "id":        message_id,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "chat_id":   st.session_state.current_chat_id,
+        "question":  question,
+        "answer":    answer,
+        "feedback":  feedback_value,  # "like" or "dislike"
+        "sources":   sources,
+    })
+    # Reflect the feedback back into the saved conversation too, so it shows
+    # up if the conversation is reopened later from the sidebar.
+    for m in st.session_state.messages:
+        if m.get("id") == message_id:
+            m["feedback"] = feedback_value
+            break
+    save_chat()
+    st.toast(
+        "Merci pour votre retour ! 🙏" if feedback_value == "like"
+        else "Merci, c'est noté — on va améliorer ça. 🛠️"
+    )
 
 
 def ensure_collection(client):
@@ -928,6 +1198,11 @@ pipeline_slot.markdown(render_pipeline({k["key"]: "idle" for k in STATIONS}, {})
 for msg in st.session_state.messages:
     with st.chat_message("user" if msg["role"] == "user" else "assistant"):
         st.markdown(msg["content"])
+        if msg["role"] == "assistant" and msg.get("feedback"):
+            st.caption(
+                "👍 Marqué comme utile" if msg["feedback"] == "like"
+                else "👎 Marqué comme pas utile"
+            )
 
 query = st.chat_input("Ex : Quel est l'historique de la société ?")
 ask = query is not None
@@ -1016,6 +1291,11 @@ elif ask and query:
         reverse=True,
     )[:5]
 
+    # Context Expansion: fetch the previous/next chunk for each of the top 5
+    # selected chunks, so a section split awkwardly by the semantic chunker
+    # (see CTX.1 in the improvement-axes doc) still reaches the LLM whole.
+    expanded_by_id = expand_with_neighbors(client, ranked)
+
     timings["rerank"] = time.time() - t0
     states["rerank"]  = "done"
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
@@ -1025,16 +1305,51 @@ elif ask and query:
     pipeline_slot.markdown(render_pipeline(states, timings), unsafe_allow_html=True)
     t0 = time.time()
 
+    # Keep the rerank order for the "SOURCE N" numbering shown to the user
+    # (and used for citations), but build the context passed to the LLM in
+    # DOCUMENT ORDER (same source file + page/chunk_id ascending) whenever
+    # chunks come from the same document. This matters because the semantic
+    # chunker sometimes splits an enumerated section (e.g. "2.1 / 2.2 / 2.3 /
+    # 2.4 Types de Factures") across two separate chunks. If those chunks are
+    # then fed to the LLM in rerank-score order instead of document order,
+    # the tail of one chunk (e.g. the end of item 2.3 + all of item 2.4) can
+    # read like a disconnected footnote instead of a continuation of the
+    # list, and the model may miss it as a distinct enumerated item.
+    def _sort_key(pair):
+        p, _ = pair
+        page = p.payload.get("page", 0)
+        page = page if isinstance(page, (int, float)) else 0
+        return (p.payload.get("source", ""), page, p.payload.get("chunk_id", 0))
+
+    ranked_for_context = sorted(ranked, key=_sort_key)
+    source_numbers = {id(p): i + 1 for i, (p, _) in enumerate(ranked)}
+
+    # Truncation limit raised from 1500 to 2500 chars per source, since each
+    # source now typically includes its neighboring chunks too (Context
+    # Expansion). This does increase prompt size / generation time somewhat
+    # — a deliberate trade-off given the hardware constraints already
+    # documented, favoring completeness over raw speed.
     context = "\n\n".join([
-        f"[Source {i+1} — {p.payload.get('source','?')} {p.payload.get('version_id','')}]:\n"
-        f"{p.payload['text'][:1500]}"
-        for i, (p, _) in enumerate(ranked)
+        f"[Source {source_numbers[id(p)]} — {p.payload.get('source','?')} {p.payload.get('version_id','')}]:\n"
+        f"{expanded_by_id.get(p.id, p.payload['text'])[:2500]}"
+        for p, _ in ranked_for_context
     ])
 
     prompt = f"""Tu es un assistant utile. Réponds TOUJOURS en français, quelle que soit la langue de la question.
 Réponds uniquement à partir des sources ci-dessous.
 Si la réponse n'est pas dans les sources, dis "Je n'ai pas suffisamment d'informations."
-Cite toujours la source (nom du fichier et version) que tu as utilisée.
+
+Citations obligatoires : après CHAQUE affirmation tirée d'une source, insère immédiatement une citation
+au format [Source N], où N est exactement le numéro indiqué entre crochets au début de la source
+correspondante ci-dessous (par exemple [Source 1] ou [Source 3]). N'utilise jamais le nom du fichier
+dans le texte de la réponse — uniquement ce format [Source N]. Si une affirmation s'appuie sur plusieurs
+sources, cite-les toutes, par exemple [Source 1][Source 2].
+
+Attention : les sources peuvent contenir des listes énumérées ou numérotées (ex. types, catégories, étapes,
+sections 2.1, 2.2, 2.3...). Certaines de ces listes peuvent être coupées entre deux sources différentes.
+Avant de répondre, identifie TOUS les éléments numérotés ou énumérés pertinents présents dans l'ensemble
+des sources, même s'ils apparaissent en fin d'une source ou semblent être une continuation d'un paragraphe
+précédent. Ne t'arrête pas au premier groupe d'éléments trouvé : vérifie chaque source jusqu'au bout.
 
 {context}
 
@@ -1049,11 +1364,45 @@ Réponse :"""
     answer     = response["message"]["content"]
     total_time = sum(timings.values())
 
+    # Unique id for this assistant turn, used to key the like/dislike buttons
+    # and to re-attach feedback to the right message afterwards.
+    message_id = str(uuid.uuid4())
+
+    # Built once here and reused both for the LLM-facing citations and for
+    # the persisted message / feedback log, instead of rebuilding it twice.
+    sources_payload = [
+        {
+            "file":    point.payload.get("source", "inconnu"),
+            "version": point.payload.get("version_id", ""),
+            "score":   float(score),
+        }
+        for point, score in ranked
+    ]
+
+    # Automatic logging of unanswered questions (axe 9) — this runs
+    # regardless of whether the user gives explicit like/dislike feedback,
+    # so it captures every documentation gap the chatbot hits.
+    if is_unanswered(answer):
+        log_unanswered(query, answer, active_ids, st.session_state.current_chat_id)
+
     with result_slot.container():
+        # One real PDF link per ranked source, built from document_id +
+        # version + page (see build_source_href above). Used both for the
+        # inline [Source N] citations in the answer, and for the "open
+        # document" link on each source card below.
+        source_hrefs = [
+            build_source_href(
+                p.payload.get("document_id", p.payload.get("source", "")),
+                p.payload.get("version", "v1"),
+                p.payload.get("page"),
+            )
+            for p, _ in ranked
+        ]
+        answer_html = linkify_citations(answer, source_hrefs)
         st.markdown(f"""
         <div class="answer-medallion">
             <div class="answer-label">Réponse</div>
-            <div class="answer-text">{answer}</div>
+            <div class="answer-text">{answer_html}</div>
             <div class="stat-row">
                 <div class="stat-pill">⏱️ Total <b>{total_time:.1f}s</b></div>
                 <div class="stat-pill">📥 Prompt <b>{response.get('prompt_eval_count','—')} tokens</b></div>
@@ -1071,18 +1420,45 @@ Réponse :"""
             version_id  = point.payload.get("version_id", "")
             is_keyword  = point.id not in vector_ids
             kw_badge    = '<span class="source-keyword-badge">keyword</span>' if is_keyword else ""
+            href        = source_hrefs[i]
+            if href:
+                file_line = f'<a href="{href}" target="_blank" class="source-file-link">📄 {source_file} — ouvrir le document ↗</a>'
+            else:
+                # No matching PDF found in static/documents/ for this
+                # source (see resolve_static_pdf_filename) — show the plain
+                # file name instead of a link that would 404.
+                file_line = f'<div class="source-file">📄 {source_file}</div>'
             st.markdown(f"""
-            <div class="source-bubble">
+            <div class="source-bubble" id="source-{i+1}">
                 <div class="source-num">{i+1}</div>
                 <div class="source-body">
                     <div class="source-head">
                         <span class="source-tag">SOURCE {i+1} · {version_id}{kw_badge}</span>
                         <span class="source-score">rerank {score:.3f}</span>
                     </div>
-                    <div class="source-file">📄 {source_file}</div>
+                    {file_line}
                     <div class="source-snippet">{point.payload['text'][:400]}…</div>
                 </div>
             </div>""", unsafe_allow_html=True)
+
+        # =====================================
+        # FEEDBACK (axe 6 — boutons Like / Dislike)
+        # =====================================
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Cette réponse vous a-t-elle été utile ?**")
+        fb_col1, fb_col2, fb_col3 = st.columns([1, 1, 6])
+        with fb_col1:
+            st.button(
+                "👍 Utile", key=f"like_{message_id}", use_container_width=True,
+                on_click=handle_feedback,
+                args=(message_id, query, answer, sources_payload, "like"),
+            )
+        with fb_col2:
+            st.button(
+                "👎 Pas utile", key=f"dislike_{message_id}", use_container_width=True,
+                on_click=handle_feedback,
+                args=(message_id, query, answer, sources_payload, "dislike"),
+            )
 
         # =====================================
         # SAVE THE CONVERSATION
@@ -1090,18 +1466,13 @@ Réponse :"""
 
         st.session_state.messages.append(
            {
+                 "id": message_id,
                  "role": "assistant",
                  "content": answer,
-                 "sources": [
-              {
-                "file": point.payload.get("source", "inconnu"),
-                "version": point.payload.get("version_id", ""),
-                "score": float(score),
-               }
-               for point, score in ranked
-             ],
-             "timestamp": datetime.now().strftime("%H:%M"),
-             "response_time": total_time,
+                 "sources": sources_payload,
+                 "feedback": None,
+                 "timestamp": datetime.now().strftime("%H:%M"),
+                 "response_time": total_time,
            }
         )
 

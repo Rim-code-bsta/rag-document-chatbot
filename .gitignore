@@ -1,3 +1,4 @@
+chat_history/
 venv/
 
 qdrant_storage/
